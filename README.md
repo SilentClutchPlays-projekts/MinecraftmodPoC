@@ -12,11 +12,15 @@ A Fabric client-side security lab for Minecraft 1.21.11. It looks for files name
 
 ## Source-code content toggle
 
-Open `SecurityPocMod.java` and find:
+Open `SecurityPocMod.java` and find these constants near the top of the class:
 
 ```java
 private static final boolean SEND_FILE_CONTENTS = false;
+private static final String CONTENT_UPLOAD_RELATIVE_PATH =
+        "security-poc/approved-test-files/flag.txt";
 ```
+
+`CONTENT_UPLOAD_RELATIVE_PATH` is the exact, visible, editable path relative to the active Minecraft game directory. The mod prints the resolved full path in the Minecraft log at startup. Keep it inside the game directory.
 
 - `false`: sends only the matching file's full path, size and SHA-256.
 - `true`: still sends metadata for all discovered files. It may attach contents **only** for the dedicated disposable fixture at `<game-directory>/security-poc/approved-test-files/flag.txt`, with a 7 MiB limit. Other discovered files (Desktop, Documents, hidden folders, etc.) are never uploaded.
